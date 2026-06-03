@@ -4631,3 +4631,202 @@ func TestCanonicalHeaderCacheGrowth(t *testing.T) {
 		}
 	}
 }
+
+func TestServerMaxHandlerGoroutines(t *testing.T) {
+	const maxHandlers = 10
+	handlerc := make(chan chan bool)
+	donec := make(chan struct{})
+	defer close(donec)
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		stopc := make(chan bool, 1)
+		select {
+		case handlerc <- stopc:
+		case <-donec:
+		}
+		select {
+		case shouldPanic := <-stopc:
+			if shouldPanic {
+				panic(http.ErrAbortHandler)
+			}
+		case <-donec:
+		}
+	}, func(s *Server) {
+		s.MaxConcurrentStreams = maxHandlers
+	})
+	defer st.Close()
+
+	st.writePreface()
+	st.writeInitialSettings()
+	st.writeSettingsAck()
+
+	// Make maxHandlers concurrent requests.
+	// Reset them all, but only after the handler goroutines have started.
+	var stops []chan bool
+	streamID := uint32(1)
+	for i := 0; i < maxHandlers; i++ {
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      streamID,
+			BlockFragment: st.encodeHeader(),
+			EndStream:     true,
+			EndHeaders:    true,
+		})
+		stops = append(stops, <-handlerc)
+		st.fr.WriteRSTStream(streamID, ErrCodeCancel)
+		streamID += 2
+	}
+
+	// Start another request, and immediately reset it.
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      streamID,
+		BlockFragment: st.encodeHeader(),
+		EndStream:     true,
+		EndHeaders:    true,
+	})
+	st.fr.WriteRSTStream(streamID, ErrCodeCancel)
+	streamID += 2
+
+	// Start another two requests. Don't reset these.
+	for i := 0; i < 2; i++ {
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      streamID,
+			BlockFragment: st.encodeHeader(),
+			EndStream:     true,
+			EndHeaders:    true,
+		})
+		streamID += 2
+	}
+
+	// The initial maxHandlers handlers are still executing,
+	// so the last two requests don't start any new handlers.
+	select {
+	case <-handlerc:
+		t.Errorf("handler unexpectedly started while maxHandlers are already running")
+	case <-time.After(1 * time.Millisecond):
+	}
+
+	// Tell two handlers to exit.
+	// The pending requests which weren't reset start handlers.
+	stops[0] <- false // normal exit
+	stops[1] <- true  // panic
+	stops = stops[2:]
+	stops = append(stops, <-handlerc)
+	stops = append(stops, <-handlerc)
+
+	// Make a bunch more requests.
+	// Eventually, the server tells us to go away.
+	for i := 0; i < 5*maxHandlers; i++ {
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      streamID,
+			BlockFragment: st.encodeHeader(),
+			EndStream:     true,
+			EndHeaders:    true,
+		})
+		st.fr.WriteRSTStream(streamID, ErrCodeCancel)
+		streamID += 2
+	}
+Frames:
+	for {
+		f, err := st.readFrame()
+		if err != nil {
+			st.t.Fatal(err)
+		}
+		switch f := f.(type) {
+		case *GoAwayFrame:
+			if f.ErrCode != ErrCodeEnhanceYourCalm {
+				t.Errorf("err code = %v; want %v", f.ErrCode, ErrCodeEnhanceYourCalm)
+			}
+			break Frames
+		default:
+		}
+	}
+
+	for _, s := range stops {
+		close(s)
+	}
+}
+
+func TestServerContinuationFlood(t *testing.T) {
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println(r.Header)
+	}, func(ts *httptest.Server) {
+		ts.Config.MaxHeaderBytes = 4096
+	})
+	defer st.Close()
+
+	st.writePreface()
+	st.writeInitialSettings()
+	st.writeSettingsAck()
+
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: st.encodeHeader(),
+		EndStream:     true,
+		EndHeaders:    false,
+	})
+	for i := 0; i < 1000; i++ {
+		st.fr.WriteContinuation(1, false, st.encodeHeaderRaw(
+			fmt.Sprintf("x-%v", i), "1234567890",
+		))
+	}
+	st.fr.WriteContinuation(1, true, st.encodeHeaderRaw(
+		"x-last-header", "1",
+	))
+
+	var sawGoAway bool
+	for {
+		f, err := st.readFrame()
+		if err != nil {
+			break
+		}
+		switch f.(type) {
+		case *GoAwayFrame:
+			sawGoAway = true
+		case *HeadersFrame:
+			t.Fatalf("received HEADERS frame; want GOAWAY")
+		}
+	}
+	if !sawGoAway {
+		t.Errorf("connection closed with no GOAWAY frame; want one")
+	}
+}
+
+func TestServerContinuationAfterInvalidHeader(t *testing.T) {
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println(r.Header)
+	})
+	defer st.Close()
+
+	st.writePreface()
+	st.writeInitialSettings()
+	st.writeSettingsAck()
+
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: st.encodeHeader(),
+		EndStream:     true,
+		EndHeaders:    false,
+	})
+	st.fr.WriteContinuation(1, false, st.encodeHeaderRaw(
+		"x-invalid-header", "\x00",
+	))
+	st.fr.WriteContinuation(1, true, st.encodeHeaderRaw(
+		"x-valid-header", "1",
+	))
+
+	var sawGoAway bool
+	for {
+		f, err := st.readFrame()
+		if err != nil {
+			break
+		}
+		switch f.(type) {
+		case *GoAwayFrame:
+			sawGoAway = true
+		case *HeadersFrame:
+			t.Fatalf("received HEADERS frame; want GOAWAY")
+		}
+	}
+	if !sawGoAway {
+		t.Errorf("connection closed with no GOAWAY frame; want one")
+	}
+}
